@@ -7,12 +7,17 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
+import unidecode
+import soundfile
 import datasets
+import librosa
 import numpy as np
 import torch
 import torchaudio
 from packaging import version
 from torch import nn
+
+from audiomentations import Compose, AddGaussianNoise, Gain, PitchShift, Shift
 
 import transformers
 from transformers import (
@@ -27,6 +32,7 @@ from transformers import (
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
+from transformers.trainer_pt_utils import LengthGroupedSampler
 
 
 if is_apex_available():
@@ -52,6 +58,10 @@ class ModelArguments:
 
     model_name_or_path: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
+    load_processor: Optional[bool] = field(
+        default=True,
+        metadata={"help": "Should the processor/tokenizer be loaded with the checkpointed model or set up a new LM head"}
     )
     cache_dir: Optional[str] = field(
         default=None,
@@ -107,9 +117,15 @@ class DataTrainingArguments:
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
     )
     train_split_name: Optional[str] = field(
-        default="train+validation",
+        default="train",
         metadata={
             "help": "The name of the training data set split to use (via the datasets library). Defaults to 'train'"
+        },
+    )
+    eval_split_name: Optional[str] = field(
+        default="test",
+        metadata={
+            "help": "The name of the evaluation data set split to use (via the datasets library). Defaults to 'test'"
         },
     )
     overwrite_cache: bool = field(
@@ -134,8 +150,14 @@ class DataTrainingArguments:
         },
     )
     chars_to_ignore: List[str] = list_field(
-        default=[",", "?", ".", "!", "-", ";", ":", '""', "%", "'", '"', "�"],
+        default=[r'!"#$%&()*+,./:;<=>?@\[\]\\_{}|~£¤¨©ª«¬®¯°·¸»¼½¾ðʺ˜˝ˮ‐–—―‚“”„‟•…″‽₋€™−√�'],
         metadata={"help": "A list of characters to remove from the transcripts."},
+    )
+    augmented: bool = field(
+        default=False,
+        metadata={
+            "help": "Duplicate training data, with acoustic manipulations"
+        }
     )
 
 
@@ -254,6 +276,30 @@ class CTCTrainer(Trainer):
 
         return loss.detach()
 
+    
+# solution from https://discuss.huggingface.co/t/spanish-asr-fine-tuning-wav2vec2/4586/6
+class GroupedLengthsTrainer(CTCTrainer):
+    # length_field_name should possibly be part of TrainingArguments instead
+    def __init__(self, train_seq_lengths:List[int], *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_seq_lengths = train_seq_lengths
+    
+    def _get_train_sampler(self) -> Optional[torch.utils.data.sampler.Sampler]:
+        if isinstance(self.train_dataset, torch.utils.data.IterableDataset) or not isinstance(
+            self.train_dataset, collections.abc.Sized
+        ):
+            return None
+
+        # Build the sampler.
+        if self.args.group_by_length:
+            # lengths = self.train_dataset[self.length_field_name] if self.length_field_name is not None else None
+            model_input_name = self.tokenizer.model_input_names[0] if self.tokenizer is not None else None
+            return LengthGroupedSampler(
+                self.train_dataset, self.args.train_batch_size, lengths=self.train_seq_lengths, model_input_name=model_input_name
+            )
+        else:
+            return super()._get_train_sampler()
+    
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -268,9 +314,18 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
+        
     # Detecting last checkpoint.
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train and not training_args.overwrite_output_dir:
+        logger.info(f"Looking for last checkpoint in {training_args.output_dir}")
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
         if last_checkpoint is None and len(os.listdir(training_args.output_dir)) > 0:
             raise ValueError(
@@ -283,13 +338,7 @@ def main():
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
 
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
+
 
     # Log on each process the small summary:
     logger.warning(
@@ -305,66 +354,81 @@ def main():
     set_seed(training_args.seed)
 
     # Get the datasets:
+    logger.info("Loading the raw audio files")
     train_dataset = datasets.load_dataset(
-        "common_voice", data_args.dataset_config_name, split=data_args.train_split_name
+        "common_voice", data_args.dataset_config_name, split=data_args.train_split_name, cache_dir=model_args.cache_dir
     )
-    eval_dataset = datasets.load_dataset("common_voice", data_args.dataset_config_name, split="test")
+    # train_dataset = train_dataset.filter(lambda example: example["up_votes"] > example["down_votes"])
+    eval_dataset = datasets.load_dataset("common_voice", data_args.dataset_config_name, split=data_args.eval_split_name, cache_dir=model_args.cache_dir)
 
-    # Create and save tokenizer
+    logger.info("Normalizing transcriptions")
     chars_to_ignore_regex = f'[{"".join(data_args.chars_to_ignore)}]'
 
     def remove_special_characters(batch):
-        batch["text"] = re.sub(chars_to_ignore_regex, "", batch["sentence"]).lower() + " "
+        batch["text"] = re.sub(r'[‘’´`]', r"'", batch["sentence"])
+        batch["text"] = re.sub(chars_to_ignore_regex, "", batch["text"]).lower().strip() + " "
+        batch["text"] = re.sub(r"(-|' | '|  +)", " ", batch["text"])
+        batch["text"] = unidecode.unidecode(batch["text"])
         return batch
 
-    train_dataset = train_dataset.map(remove_special_characters, remove_columns=["sentence"])
-    eval_dataset = eval_dataset.map(remove_special_characters, remove_columns=["sentence"])
+    train_dataset = train_dataset.map(remove_special_characters, remove_columns=["sentence"], num_proc=data_args.preprocessing_num_workers)
+    eval_dataset = eval_dataset.map(remove_special_characters, remove_columns=["sentence"], num_proc=data_args.preprocessing_num_workers)
 
     def extract_all_chars(batch):
         all_text = " ".join(batch["text"])
         vocab = list(set(all_text))
         return {"vocab": [vocab], "all_text": [all_text]}
 
-    vocab_train = train_dataset.map(
-        extract_all_chars,
-        batched=True,
-        batch_size=-1,
-        keep_in_memory=True,
-        remove_columns=train_dataset.column_names,
-    )
-    vocab_test = train_dataset.map(
-        extract_all_chars,
-        batched=True,
-        batch_size=-1,
-        keep_in_memory=True,
-        remove_columns=eval_dataset.column_names,
-    )
-
-    vocab_list = list(set(vocab_train["vocab"][0]) | set(vocab_test["vocab"][0]))
-    vocab_dict = {v: k for k, v in enumerate(vocab_list)}
-    vocab_dict["|"] = vocab_dict[" "]
-    del vocab_dict[" "]
-    vocab_dict["[UNK]"] = len(vocab_dict)
-    vocab_dict["[PAD]"] = len(vocab_dict)
-
-    with open("vocab.json", "w") as vocab_file:
-        json.dump(vocab_dict, vocab_file)
-
     # Load pretrained model and tokenizer
     #
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    tokenizer = Wav2Vec2CTCTokenizer(
-        "vocab.json",
-        unk_token="[UNK]",
-        pad_token="[PAD]",
-        word_delimiter_token="|",
-    )
-    feature_extractor = Wav2Vec2FeatureExtractor(
-        feature_size=1, sampling_rate=16_000, padding_value=0.0, do_normalize=True, return_attention_mask=True
-    )
-    processor = Wav2Vec2Processor(feature_extractor=feature_extractor, tokenizer=tokenizer)
+
+    if last_checkpoint and model_args.load_processor:
+        logger.info(f"Loading pretrained processor from {model_args.model_name_or_path}")
+        processor = Wav2Vec2Processor.from_pretrained(model_args.model_name_or_path)
+        logger.info(processor.tokenizer.get_vocab())
+    else:
+        logger.info("Creating tokenizer and processor")
+        vocab_train = train_dataset.map(
+            extract_all_chars,
+            batched=True,
+            batch_size=-1,
+            keep_in_memory=True,
+            remove_columns=train_dataset.column_names,
+        )
+        vocab_test = eval_dataset.map(
+            extract_all_chars,
+            batched=True,
+            batch_size=-1,
+            keep_in_memory=True,
+            remove_columns=eval_dataset.column_names,
+        )
+
+        vocab_list = list(set(vocab_train["vocab"][0]) | set(vocab_test["vocab"][0]))
+        vocab_dict = {v: k for k, v in enumerate(vocab_list)}
+        vocab_dict["|"] = vocab_dict[" "]
+        del vocab_dict[" "]
+        vocab_dict["[UNK]"] = len(vocab_dict)
+        vocab_dict["[PAD]"] = len(vocab_dict)
+
+        with open("vocab.json", "w") as vocab_file:
+            json.dump(vocab_dict, vocab_file)
+
+
+        tokenizer = Wav2Vec2CTCTokenizer(
+            "vocab.json",
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            word_delimiter_token="|",
+        )
+        feature_extractor = Wav2Vec2FeatureExtractor(
+            feature_size=1, sampling_rate=16_000, padding_value=0.0, do_normalize=True, return_attention_mask=True
+        )
+        processor = Wav2Vec2Processor(feature_extractor=feature_extractor, tokenizer=tokenizer)
+        processor.save_pretrained(training_args.output_dir)
+        
     model = Wav2Vec2ForCTC.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
@@ -377,7 +441,7 @@ def main():
         layerdrop=model_args.layerdrop,
         ctc_loss_reduction="mean",
         pad_token_id=processor.tokenizer.pad_token_id,
-        vocab_size=len(processor.tokenizer),
+        # vocab_size=len(processor.tokenizer),
     )
 
     if data_args.max_train_samples is not None:
@@ -386,8 +450,16 @@ def main():
     if data_args.max_val_samples is not None:
         eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
 
+    logger.info("Vectorizing audio files")
     resampler = torchaudio.transforms.Resample(48_000, 16_000)
 
+    augment = Compose([
+        AddGaussianNoise(min_amplitude=0.0001, max_amplitude=0.01, p=1),
+        PitchShift(min_semitones=-3, max_semitones=3, p=0.8),
+        Gain(min_gain_in_db=-6, max_gain_in_db=6, p=0.8),
+        Shift(min_fraction=-0.5, max_fraction=0.5, p=0.8),
+    ])
+    
     # Preprocessing the datasets.
     # We need to read the aduio files as arrays and tokenize the targets.
     def speech_file_to_array_fn(batch):
@@ -397,17 +469,43 @@ def main():
         batch["target_text"] = batch["text"]
         return batch
 
+    def augmented_speech_file_to_array_fn(batch):
+        try:
+            speech_array, sampling_rate = soundfile.read(batch["path"] + "-augmented.wav")
+        except:
+            speech_array, sampling_rate = torchaudio.load(batch["path"])
+            speech_array = resampler(speech_array)
+            speech_array = augment(samples=speech_array, sample_rate=sampling_rate).squeeze()
+            soundfile.write(batch["path"]+"-augmented.wav", speech_array, sampling_rate, subtype='PCM_24')
+
+        batch["speech"] = speech_array
+        batch["sampling_rate"] = 16_000
+        batch["target_text"] = batch["text"]
+        return batch
+    
+    if data_args.augmented:
+        logger.info("Creating augmented audio data")
+        train_augmented = train_dataset.map(
+            augmented_speech_file_to_array_fn, 
+            remove_columns=train_dataset.column_names, 
+            num_proc=data_args.preprocessing_num_workers
+        )
+        
     train_dataset = train_dataset.map(
         speech_file_to_array_fn,
         remove_columns=train_dataset.column_names,
-        num_proc=data_args.preprocessing_num_workers,
+        num_proc=1,
     )
     eval_dataset = eval_dataset.map(
         speech_file_to_array_fn,
         remove_columns=eval_dataset.column_names,
-        num_proc=data_args.preprocessing_num_workers,
+        num_proc=1,
     )
 
+    if data_args.augmented:
+        train_dataset = datasets.concatenate_datasets([train_dataset, train_augmented])
+                                                                
+                                                                
     def prepare_dataset(batch):
         # check that all files have the correct sampling rate
         assert (
@@ -426,6 +524,7 @@ def main():
         batched=True,
         num_proc=data_args.preprocessing_num_workers,
     )
+    logging.info(f"Training set is {len(train_dataset)} examples.")
     eval_dataset = eval_dataset.map(
         prepare_dataset,
         remove_columns=eval_dataset.column_names,
@@ -433,6 +532,7 @@ def main():
         batched=True,
         num_proc=data_args.preprocessing_num_workers,
     )
+    logging.info(f"Validation set is {len(eval_dataset)} examples.")
 
     # Metric
     wer_metric = datasets.load_metric("wer")
@@ -458,6 +558,7 @@ def main():
     data_collator = DataCollatorCTCWithPadding(processor=processor, padding=True)
 
     # Initialize our Trainer
+    logger.info("Initializing the trainer")
     trainer = CTCTrainer(
         model=model,
         data_collator=data_collator,
@@ -465,7 +566,7 @@ def main():
         compute_metrics=compute_metrics,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
-        tokenizer=processor.feature_extractor,
+        tokenizer=processor.feature_extractor
     )
 
     # Training
@@ -476,12 +577,9 @@ def main():
             checkpoint = model_args.model_name_or_path
         else:
             checkpoint = None
+        logger.info("Beginning training")
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()
-
-        # save the feature_extractor and the tokenizer
-        if is_main_process(training_args.local_rank):
-            processor.save_pretrained(training_args.output_dir)
 
         metrics = train_result.metrics
         max_train_samples = (
