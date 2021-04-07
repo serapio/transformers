@@ -372,7 +372,9 @@ def main():
         return batch
 
     train_dataset = train_dataset.map(remove_special_characters, remove_columns=["sentence"], num_proc=data_args.preprocessing_num_workers)
+    train_dataset = train_dataset.filter(lambda example: example["down_votes"] == 0)
     eval_dataset = eval_dataset.map(remove_special_characters, remove_columns=["sentence"], num_proc=data_args.preprocessing_num_workers)
+    eval_dataset = train_dataset.filter(lambda example: example["down_votes"] == 0)
 
     def extract_all_chars(batch):
         all_text = " ".join(batch["text"])
@@ -504,8 +506,10 @@ def main():
 
     if data_args.augmented:
         train_dataset = datasets.concatenate_datasets([train_dataset, train_augmented])
-                                                                
-                                                                
+        
+    # remove data that is too long to avoid getting GPU out of memory error
+    train_dataset = train_dataset.filter(lambda batch: len(batch["speech"]) < 150000)
+        
     def prepare_dataset(batch):
         # check that all files have the correct sampling rate
         assert (
