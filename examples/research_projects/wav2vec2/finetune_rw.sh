@@ -2,24 +2,25 @@
 set -e
 
 LANG="rw"
-OUTPUT_DIR="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-${LANG}"
-CHECKPOINT="$(ls -d ${OUTPUT_DIR})"
+OUTPUT_DIR="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-${LANG}-50"
+CHECKPOINT="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-${LANG}-50"
 if [ -z $CHECKPOINT ]; then
     CHECKPOINT="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-kinyarwanda"
+    # CHECKPOINT="facebook/wav2vec2-large-xlsr-53"
 fi
 SHARD=$1
 if [ -z $SHARD ]; then
-    SHARD=0
+    SHARD=1
 fi
-START=$(expr $SHARD \* 16384)
-END=$(expr $START + 16384)
-EPOCHS=$(expr 10 \* $SHARD + 10)
+START="$(expr $SHARD \* 40960)"
+END="$(expr $SHARD \* 40960 + 40960)"
+EPOCHS=$(expr 50 \* $SHARD - 40 )
 echo "Using shard $SHARD from $START to $END until $EPOCHS epochs"
 
 python run_common_voice.py \
     --model_name_or_path="$CHECKPOINT" \
     --dataset_config_name="$LANG" \
-    --load_processor="1" \
+    --load_processor \
     --augmented="0" \
     --output_dir="$OUTPUT_DIR" \
     --cache_dir=/workspace/raw_data/$LANG \
@@ -43,10 +44,10 @@ python run_common_voice.py \
     --attention_dropout="0.1" \
     --activation_dropout="0.05" \
     --hidden_dropout="0.05" \
-    --mask_time_prob="0.1" \
+    --mask_time_prob="0.2" \
     --layerdrop="0.05" \
     --gradient_checkpointing \
     --max_val_samples="1024" \
-    --max_train_samples="12288" \
+    --max_train_samples="32768" \
     --do_train --do_eval \
-   # --overwrite_output_dir 
+ #   "$OVERWRITE"

@@ -365,7 +365,7 @@ def main():
     chars_to_ignore_regex = f'[{"".join(data_args.chars_to_ignore)}]'
 
     def remove_special_characters(batch):
-        batch["text"] = re.sub(r'[‘’´`]', r"'", batch["sentence"])
+        batch["text"] = re.sub(r'[ʻʽʼ‘’´`]', r"'", batch["sentence"])
         batch["text"] = re.sub(chars_to_ignore_regex, "", batch["text"]).lower().strip() + " "
         batch["text"] = re.sub(r"(-|' | '|  +)", " ", batch["text"])
         batch["text"] = unidecode.unidecode(batch["text"])
@@ -374,7 +374,7 @@ def main():
     train_dataset = train_dataset.map(remove_special_characters, remove_columns=["sentence"], num_proc=data_args.preprocessing_num_workers)
     train_dataset = train_dataset.filter(lambda example: example["down_votes"] == 0)
     eval_dataset = eval_dataset.map(remove_special_characters, remove_columns=["sentence"], num_proc=data_args.preprocessing_num_workers)
-    eval_dataset = train_dataset.filter(lambda example: example["down_votes"] == 0)
+    #eval_dataset = train_dataset.filter(lambda example: example["down_votes"] == 0)
 
     def extract_all_chars(batch):
         all_text = " ".join(batch["text"])
@@ -408,7 +408,7 @@ def main():
             remove_columns=eval_dataset.column_names,
         )
 
-        vocab_list = list(set(vocab_train["vocab"][0]) | set(vocab_test["vocab"][0]))
+        vocab_list = sorted(list(set(vocab_train["vocab"][0]) | set(vocab_test["vocab"][0])))
         vocab_dict = {v: k for k, v in enumerate(vocab_list)}
         vocab_dict["|"] = vocab_dict[" "]
         del vocab_dict[" "]
