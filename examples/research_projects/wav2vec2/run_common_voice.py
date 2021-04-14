@@ -367,14 +367,19 @@ def main():
     def remove_special_characters(batch):
         batch["text"] = re.sub(r'[ʻʽʼ‘’´`]', r"'", batch["sentence"])
         batch["text"] = re.sub(chars_to_ignore_regex, "", batch["text"]).lower().strip() + " "
-        batch["text"] = re.sub(r"(-|' | '|  +)", " ", batch["text"])
+        batch["text"] = re.sub(r"([b-df-hj-np-tv-z])'? ([aeiou])", r"\1'\2", batch["text"])
+        batch["text"] = re.sub(r"(-| '|' |  +)", " ", batch["text"])
         batch["text"] = unidecode.unidecode(batch["text"])
         return batch
 
     train_dataset = train_dataset.map(remove_special_characters, remove_columns=["sentence"], num_proc=data_args.preprocessing_num_workers)
+    if data_args.max_train_samples is not None:
+        train_dataset = train_dataset.train_test_split(train_size=int(1.2 * data_args.max_train_samples))["train"]
     train_dataset = train_dataset.filter(lambda example: example["down_votes"] == 0)
+    
     eval_dataset = eval_dataset.map(remove_special_characters, remove_columns=["sentence"], num_proc=data_args.preprocessing_num_workers)
-    #eval_dataset = train_dataset.filter(lambda example: example["down_votes"] == 0)
+    if data_args.max_val_samples is not None:
+        eval_dataset = eval_dataset.train_test_split(test_size=data_args.max_val_samples)["test"]
 
     def extract_all_chars(batch):
         all_text = " ".join(batch["text"])
@@ -446,12 +451,6 @@ def main():
         # vocab_size=len(processor.tokenizer),
     )
 
-    if data_args.max_train_samples is not None:
-        train_dataset = train_dataset.select(range(data_args.max_train_samples))
-
-    if data_args.max_val_samples is not None:
-        eval_dataset = eval_dataset.select(range(data_args.max_val_samples))
-
     logger.info("Vectorizing audio files")
     resampler = torchaudio.transforms.Resample(48_000, 16_000)
 
@@ -509,6 +508,9 @@ def main():
         
     # remove data that is too long to avoid getting GPU out of memory error
     train_dataset = train_dataset.filter(lambda batch: len(batch["speech"]) < 150000)
+        
+    if data_args.max_train_samples is not None:
+        train_dataset = train_dataset.select(range(data_args.max_train_samples))
         
     def prepare_dataset(batch):
         # check that all files have the correct sampling rate

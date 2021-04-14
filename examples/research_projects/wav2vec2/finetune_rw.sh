@@ -2,19 +2,17 @@
 set -e
 
 LANG="rw"
-OUTPUT_DIR="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-${LANG}-50"
-CHECKPOINT="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-${LANG}-50"
-if [ -z $CHECKPOINT ]; then
-    CHECKPOINT="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-kinyarwanda"
-    # CHECKPOINT="facebook/wav2vec2-large-xlsr-53"
-fi
+OUTPUT_DIR="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-${LANG}-apos"
+#CHECKPOINT="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-${LANG}-nopunct"
+#CHECKPOINT="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-kinyarwanda"
+CHECKPOINT="facebook/wav2vec2-large-xlsr-53"
 SHARD=$1
 if [ -z $SHARD ]; then
     SHARD=1
 fi
 START="$(expr $SHARD \* 40960)"
 END="$(expr $SHARD \* 40960 + 40960)"
-EPOCHS=$(expr 50 \* $SHARD - 40 )
+EPOCHS=$(expr 10 \* $SHARD)
 echo "Using shard $SHARD from $START to $END until $EPOCHS epochs"
 
 python run_common_voice.py \
@@ -25,7 +23,7 @@ python run_common_voice.py \
     --output_dir="$OUTPUT_DIR" \
     --cache_dir=/workspace/raw_data/$LANG \
     --train_split_name="train[${START}:${END}]" \
-    --eval_split_name="validation[:10%]" \
+    --eval_split_name="validation[:15%]" \
     --preprocessing_num_workers="8" \
     --num_train_epochs="$EPOCHS" \
     --per_device_train_batch_size="32" \
@@ -44,10 +42,10 @@ python run_common_voice.py \
     --attention_dropout="0.1" \
     --activation_dropout="0.05" \
     --hidden_dropout="0.05" \
-    --mask_time_prob="0.2" \
+    --mask_time_prob="0.1" \
     --layerdrop="0.05" \
     --gradient_checkpointing \
-    --max_val_samples="1024" \
+    --max_val_samples="2048" \
     --max_train_samples="32768" \
     --do_train --do_eval \
- #   "$OVERWRITE"
+  --overwrite_output_dir
