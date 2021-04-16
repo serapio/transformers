@@ -3,15 +3,15 @@ set -e
 
 LANG="rw"
 OUTPUT_DIR="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-${LANG}-apos"
-#CHECKPOINT="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-${LANG}-nopunct"
+CHECKPOINT="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-${LANG}-apos"
 #CHECKPOINT="/workspace/checkpoints/${LANG}/wav2vec2-large-xlsr-kinyarwanda"
-CHECKPOINT="facebook/wav2vec2-large-xlsr-53"
+#CHECKPOINT="facebook/wav2vec2-large-xlsr-53"
 SHARD=$1
 if [ -z $SHARD ]; then
     SHARD=1
 fi
-START="$(expr $SHARD \* 40960)"
-END="$(expr $SHARD \* 40960 + 40960)"
+START="$(expr $SHARD \* 81920)"
+END="$(expr $SHARD \* 81920 + 81920)"
 EPOCHS=$(expr 10 \* $SHARD)
 echo "Using shard $SHARD from $START to $END until $EPOCHS epochs"
 
@@ -48,4 +48,4 @@ python run_common_voice.py \
     --max_val_samples="2048" \
     --max_train_samples="32768" \
     --do_train --do_eval \
-  --overwrite_output_dir
+ ## --overwrite_output_dir

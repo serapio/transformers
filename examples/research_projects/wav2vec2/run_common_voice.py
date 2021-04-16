@@ -360,6 +360,7 @@ def main():
     )
     # train_dataset = train_dataset.filter(lambda example: example["up_votes"] > example["down_votes"])
     eval_dataset = datasets.load_dataset("common_voice", data_args.dataset_config_name, split=data_args.eval_split_name, cache_dir=model_args.cache_dir)
+    speaker_ids = 
 
     logger.info("Normalizing transcriptions")
     chars_to_ignore_regex = f'[{"".join(data_args.chars_to_ignore)}]'
@@ -367,14 +368,14 @@ def main():
     def remove_special_characters(batch):
         batch["text"] = re.sub(r'[ʻʽʼ‘’´`]', r"'", batch["sentence"])
         batch["text"] = re.sub(chars_to_ignore_regex, "", batch["text"]).lower().strip() + " "
-        batch["text"] = re.sub(r"([b-df-hj-np-tv-z])'? ([aeiou])", r"\1'\2", batch["text"])
+        batch["text"] = re.sub(r"([b-df-hj-np-tv-z])' ([aeiou])", r"\1'\2", batch["text"])
         batch["text"] = re.sub(r"(-| '|' |  +)", " ", batch["text"])
         batch["text"] = unidecode.unidecode(batch["text"])
         return batch
 
     train_dataset = train_dataset.map(remove_special_characters, remove_columns=["sentence"], num_proc=data_args.preprocessing_num_workers)
     if data_args.max_train_samples is not None:
-        train_dataset = train_dataset.train_test_split(train_size=int(1.2 * data_args.max_train_samples))["train"]
+        train_dataset = train_dataset.train_test_split(train_size=int(1.2 * data_args.max_train_samples), load_from_cache_file=False)["train"]
     train_dataset = train_dataset.filter(lambda example: example["down_votes"] == 0)
     
     eval_dataset = eval_dataset.map(remove_special_characters, remove_columns=["sentence"], num_proc=data_args.preprocessing_num_workers)
